@@ -12,29 +12,26 @@ app.get('/proxy', async (req, res) => {
         const urlObj = new URL(targetUrl);
         const targetOrigin = urlObj.origin;
 
-        // ヘッダーはしっかり偽装する（これはサイトを表示させるために必須）
         const headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Referer': targetOrigin + '/',
-            'Cookie': req.headers.cookie || '' // テーマ設定などのためにCookieは通す
+            'Cookie': req.headers.cookie || '' 
         };
 
         const response = await axios.get(targetUrl, {
             headers: headers,
-            responseType: 'arraybuffer', // 文字化け防止
+            responseType: 'arraybuffer',
             validateStatus: () => true,
             family: 4
         });
 
         const contentType = response.headers['content-type'] || '';
         
-        // レスポンスヘッダーの設定
         res.removeHeader('X-Frame-Options');
         res.removeHeader('Content-Security-Policy');
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Content-Type', contentType);
 
-        // Set-Cookieがあれば転送（テーマ維持）
         if (response.headers['set-cookie']) {
             const cookies = response.headers['set-cookie'].map(c => 
                 c.replace(/Domain=[^;]+;/i, '').replace(/Secure/i, '').replace(/SameSite=[^;]+;/i, '')
@@ -42,56 +39,76 @@ app.get('/proxy', async (req, res) => {
             res.setHeader('Set-Cookie', cookies);
         }
 
-        // --- ここが修正の核心 ---
-        // テキストデータの時だけ処理するが、「JavaScriptの中身」はいじらない！
         if (contentType.includes('text/html')) {
             let content = response.data.toString('utf-8');
 
             const rewriteUrl = (urlStr) => {
                 try {
-                    if (!urlStr || urlStr.startsWith('data:') || urlStr.startsWith('#') || urlStr.startsWith('http')) return urlStr; // httpで始まる絶対パスはJSの可能性があるので一旦無視
-                    // 相対パスだけを狙い撃ちで書き換える
+                    if (!urlStr || urlStr.startsWith('data:') || urlStr.startsWith('#')) return urlStr;
                     const absoluteUrl = new URL(urlStr, targetUrl).href;
                     return `/proxy?url=${encodeURIComponent(absoluteUrl)}`;
                 } catch (e) { return urlStr; }
             };
 
-            // 旧版と同じように、HTMLタグの「属性」だけをピンポイントで書き換える
-            // JSコード内のURL（動画リンクなど）は書き換えないので、ブラウザが直接取りに行ける
+            // ★修正ポイント：
+            // 画像系の属性（src, data-src, poster, data-poster）なら、
+            // それが「絶対パス(http...)」であっても強制的にプロキシ経由にする！
+            // href（リンク）や action（フォーム）は相対パスのときだけ書き換える（動画リンクへの干渉を避けるため）
+            
             content = content.replace(
-                /(href|src|action|poster|data-src|data-poster)=["']([^"']+)["']/g, 
+                /(href|src|action|poster|data-src|data-poster|data-image)=["']([^"']+)["']/g, 
                 (match, attr, url) => {
-                    // httpから始まるURL（絶対パス）は、画像以外は書き換えない（動画プレイヤーへの干渉を防ぐ）
-                    if (url.startsWith('http')) {
-                        if (url.match(/\.(jpg|jpeg|png|gif|svg|webp)$/i)) {
-                            return `${attr}="/proxy?url=${encodeURIComponent(url)}"`;
-                        }
-                        return match; // そのままにする
-                    }
                     
-                    // 相対パス（/img/logo.pngなど）はプロキシ経由にする
+                    // 1. 画像系の属性は、どんなURLでも問答無用でプロキシを通す（サムネ表示のため）
+                    if (['src', 'poster', 'data-src', 'data-poster', 'data-image'].includes(attr)) {
+                        return `${attr}="${rewriteUrl(url)}"`;
+                    }
+
+                    // 2. リンク(href)やフォーム(action)の場合
+                    // もし「http」から始まる絶対パスなら、書き換えない（動画への直接リンクを守る）
+                    if (url.startsWith('http') || url.startsWith('//')) {
+                        return match; 
+                    }
+
+                    // 3. 相対パスなら書き換える
                     return `${attr}="${rewriteUrl(url)}"`;
                 }
             );
             
-            // CSSのurl()だけは書き換える（背景画像などのため）
+            // CSSのurl()書き換え
             content = content.replace(/url\(["']?([^"')]+)["']?\)/g, (full, url) => {
-                if (url.startsWith('http') && !url.match(/\.(css|jpg|png|gif)$/i)) return full;
                 return `url("${rewriteUrl(url)}")`;
             });
 
-            // 検索バーなどを動かすための最低限のJSだけ入れる（動画プレイヤーの邪魔はしない）
+            // 強制表示スクリプト (data-srcをsrcに移し替える処理)
             const injectScript = `
             <script>
-                // リンククリック時だけプロキシを通す
+                // 遅延読み込み画像を強制的に表示させる
+                setInterval(() => {
+                    document.querySelectorAll('img').forEach(img => {
+                        // data-srcを持っていて、srcが空、またはloadingのままの場合
+                        if (img.dataset.src && (!img.src || img.src.includes('loading'))) {
+                            img.src = img.dataset.src; // プロキシURLが入っているはずなのでセットする
+                            img.removeAttribute('data-src'); // ループしないように消す
+                        }
+                        // もしsrcがプロキシ経由になっていなければ書き換える
+                        else if (img.src && !img.src.includes('/proxy') && !img.src.startsWith('data:')) {
+                            // ただし動画プレイヤー関連の画像は除く（必要に応じて調整）
+                        }
+                    });
+                }, 1000);
+
+                // リンクと検索フォームの制御
                 document.addEventListener('click', e => {
                     const a = e.target.closest('a');
+                    // 内部リンク（相対パスが書き換えられたもの）以外で、外部への絶対リンクはJSでプロキシ化
+                    // ただし、動画プレイヤーが動的に生成したリンクには触れないように注意が必要
                     if(a && a.href && !a.href.includes('/proxy') && a.host !== window.location.host) {
                         e.preventDefault();
                         window.location.href = '/proxy?url=' + encodeURIComponent(a.href);
                     }
                 });
-                // 検索フォーム対策
+                
                 document.addEventListener('submit', e => {
                     e.preventDefault();
                     const form = e.target;
@@ -104,20 +121,18 @@ app.get('/proxy', async (req, res) => {
             
             content = content.replace('</body>', injectScript + '</body>');
             res.send(content);
+
         } else if (contentType.includes('text/css')) {
-            // CSSファイル内のパス書き換え
             let content = response.data.toString('utf-8');
             content = content.replace(/url\(["']?([^"')]+)["']?\)/g, (full, url) => {
                 try { return `url("/proxy?url=${encodeURIComponent(new URL(url, targetUrl).href)}")`; } catch(e){return full;}
             });
             res.send(content);
         } else {
-            // 画像やその他のファイルはそのまま流す
             res.send(response.data);
         }
 
     } catch (error) {
-        // エラーでも何か返す
         if (!res.headersSent) res.send('');
     }
 });
