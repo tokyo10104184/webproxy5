@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Web Proxy V2</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <header>
+        <h1>Web Proxy V2</h1>
+        <form id="proxy-form">
+            <input type="text" id="url-input" placeholder="https://example.com" required>
+            <button type="submit">Go</button>
+            <button type="button" id="clear-button">Clear</button>
+        </form>
+    </header>
+    <main>
+        <iframe id="content-frame"></iframe>
+    </main>
+    <script src="script.js"></script>
+</body>
+</html>
