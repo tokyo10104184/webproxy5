@@ -7,9 +7,8 @@ module.exports = app;
 app.get('/proxy', async (req, res) => {
     let targetUrl = req.query.url;
 
-    // もしURLパラメータがない場合でも、リファラー（前のページ）があれば復旧を試みる
     if (!targetUrl) {
-        return res.status(400).send('URL is required. (Navigation Error)');
+        return res.status(400).send('URL is required.');
     }
 
     try {
@@ -31,23 +30,30 @@ app.get('/proxy', async (req, res) => {
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Content-Type', contentType);
 
+        // テキストデータの処理
         if (contentType.includes('text') || contentType.includes('javascript') || contentType.includes('json')) {
             let content = response.data.toString('utf-8');
 
-            // --- 1. これまでの静的書き換え（画像表示用） ---
+            // URL書き換え関数
             const rewriteUrl = (urlStr) => {
                 try {
                     if (!urlStr || urlStr.startsWith('data:') || urlStr.startsWith('#') || urlStr.startsWith('javascript:')) return urlStr;
+                    // HTMLエンティティ(&amp;)などを簡易デコード
+                    urlStr = urlStr.replace(/&amp;/g, '&');
                     const absoluteUrl = new URL(urlStr, targetUrl).href;
                     return `/proxy?url=${encodeURIComponent(absoluteUrl)}`;
                 } catch (e) { return urlStr; }
             };
 
-            // 画像などのリソース読み込み系だけサーバー側で書き換える
-            content = content.replace(/(src|srcset|href)=["']([^"']+)["']/g, (match, attr, url) => {
-                // CSSファイルや画像ファイルへのリンクは直接書き換える
-                if(url.match(/\.(css|jpg|jpeg|png|gif|svg|js)$/i) || attr === 'srcset') {
-                     // srcset対応
+            // 1. CSSの url(...) 書き換え (CSSファイルでもHTMLでも実行)
+            content = content.replace(/url\(["']?([^"')]+)["']?\)/g, (full, url) => `url("${rewriteUrl(url)}")`);
+
+            // 2. HTMLの場合のみ、タグの属性書き換えとスクリプト注入を行う
+            // ★ここが修正ポイント：CSSファイルに誤って干渉しないようにした
+            if (contentType.includes('text/html')) {
+                
+                // リンク書き換え (src, href, action, srcset)
+                content = content.replace(/(src|href|action|srcset)=["']([^"']+)["']/g, (match, attr, url) => {
                     if (attr === 'srcset') {
                         return `srcset="${url.split(',').map(p => {
                             const [u, d] = p.trim().split(' ');
@@ -55,73 +61,76 @@ app.get('/proxy', async (req, res) => {
                         }).join(', ')}"`;
                     }
                     return `${attr}="${rewriteUrl(url)}"`;
-                }
-                return match; // 通常のリンクやフォームは下のJSで処理させるのでスルー気味にする
-            });
-            
-            content = content.replace(/url\(["']?([^"')]+)["']?\)/g, (full, url) => `url("${rewriteUrl(url)}")`);
+                });
 
-            // --- 2. ページ遷移バグを直す「スパイ・スクリプト」を注入 ---
-            // これが検索バーやリンククリックを監視して、正しいURLに導きます
-            const injectScript = `
-            <script>
-                (function() {
-                    const currentOrigin = '${targetUrl}';
-                    
-                    // リンククリックの監視
-                    document.addEventListener('click', function(e) {
-                        const anchor = e.target.closest('a');
-                        if (anchor && anchor.href) {
-                            e.preventDefault();
-                            // 絶対パスに変換してからプロキシを通す
-                            const absoluteUrl = new URL(anchor.getAttribute('href'), currentOrigin).href;
-                            window.location.href = '/proxy?url=' + encodeURIComponent(absoluteUrl);
-                        }
-                    });
-
-                    // 検索フォームなどの送信監視 (ここが今回の修正の肝)
-                    document.addEventListener('submit', function(e) {
-                        e.preventDefault();
-                        const form = e.target;
-                        const method = (form.method || 'GET').toUpperCase();
-                        const action = form.getAttribute('action') || '';
+                // スパイ・スクリプト (フォーム送信とリンククリックの監視)
+                const injectScript = `
+                <script>
+                    (function() {
+                        const currentOrigin = '${targetUrl}';
                         
-                        // フォームの送信先URLを絶対パス化
-                        const absoluteAction = new URL(action, currentOrigin).href;
+                        document.addEventListener('click', function(e) {
+                            const anchor = e.target.closest('a');
+                            if (anchor && anchor.href) {
+                                // プロキシ経由でないリンクだけ捕まえる
+                                if (!anchor.href.includes('/proxy?url=')) {
+                                    e.preventDefault();
+                                    try {
+                                        const absoluteUrl = new URL(anchor.getAttribute('href'), currentOrigin).href;
+                                        window.location.href = '/proxy?url=' + encodeURIComponent(absoluteUrl);
+                                    } catch(err) {
+                                        window.location.href = anchor.href;
+                                    }
+                                }
+                            }
+                        });
 
-                        if (method === 'GET') {
-                            // 入力されたデータをURLパラメータとして結合する
-                            const formData = new FormData(form);
-                            const params = new URLSearchParams(formData);
-                            // 既に?があるなら&でつなぐ
-                            const separator = absoluteAction.includes('?') ? '&' : '?';
-                            const finalUrl = absoluteAction + separator + params.toString();
+                        document.addEventListener('submit', function(e) {
+                            e.preventDefault();
+                            const form = e.target;
+                            const method = (form.method || 'GET').toUpperCase();
+                            const action = form.getAttribute('action') || '';
                             
-                            // プロキシ経由で移動
-                            window.location.href = '/proxy?url=' + encodeURIComponent(finalUrl);
-                        } else {
-                            // POSTの場合などは今回は未対応だがアラートを出さずに何もしない(高度な実装が必要)
-                            console.log('POST forms are not fully supported in this prototype');
-                        }
-                    });
-                })();
-            </script>
-            `;
-
-            // HTMLの </body> の直前にスクリプトを挿入
-            if (content.includes('</body>')) {
-                content = content.replace('</body>', injectScript + '</body>');
-            } else {
-                content += injectScript;
+                            try {
+                                const absoluteAction = new URL(action, currentOrigin).href;
+                                if (method === 'GET') {
+                                    const formData = new FormData(form);
+                                    const params = new URLSearchParams(formData);
+                                    const separator = absoluteAction.includes('?') ? '&' : '?';
+                                    window.location.href = '/proxy?url=' + encodeURIComponent(absoluteAction + separator + params.toString());
+                                } else {
+                                    // POSTなどもとりあえずGETとして送ってみる（検索などは動くことが多い）
+                                    form.action = '/proxy?url=' + encodeURIComponent(absoluteAction);
+                                    form.submit();
+                                }
+                            } catch(err) {
+                                console.error(err);
+                            }
+                        });
+                    })();
+                </script>
+                `;
+                
+                // </body>の前にスクリプトを入れる
+                if (content.includes('</body>')) {
+                    content = content.replace('</body>', injectScript + '</body>');
+                } else {
+                    content += injectScript;
+                }
             }
 
             res.send(content);
         } else {
+            // 画像ファイルなど
             res.send(response.data);
         }
 
     } catch (error) {
-        console.error(error);
-        res.status(500).send('Error: ' + error.message);
+        // CSSなどが404でもエラー画面を出さず、空を返す（画面崩れを最小限にするため）
+        if (req.url.includes('.css')) {
+            res.send('');
+        } else {
+            res.status(500).send('Proxy Error: ' + error.message);
+        }
     }
 });
