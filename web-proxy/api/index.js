@@ -6,14 +6,20 @@ module.exports = app;
 
 app.get('/proxy', async (req, res) => {
     let targetUrl = req.query.url;
-    
-    // 隠しフィールドから送信された場合など、クエリパラメータが散らばる可能性への対策
-    if (!targetUrl && req.query.q) {
-        // 一部のサイト検索で発生するケースへの保険（基本は下のJS対策でカバー）
-        // ここでの完全な復元は難しいため、JSでの対策がメインになります
-    }
 
-    if (!targetUrl) return res.status(400).send('URL is required.');
+    // 【追加】検索などでurlパラメータが消え、qパラメータなどが来た場合の救済措置は困難なため
+    // 基本的にはエラーを返すが、デバッグ用にログを出す
+    if (!targetUrl) {
+        // console.log('Params missing. Query:', req.query); 
+        return res.status(400).send(`
+            <div style="padding:20px;font-family:sans-serif;">
+                <h3>URL is required.</h3>
+                <p>プロキシ経由のフォーム送信に失敗しました。</p>
+                <p>現在のクエリ: ${JSON.stringify(req.query)}</p>
+                <a href="/">トップに戻る</a>
+            </div>
+        `);
+    }
 
     try {
         const urlObj = new URL(targetUrl);
@@ -21,9 +27,9 @@ app.get('/proxy', async (req, res) => {
 
         const headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Referer': targetOrigin + '/',
+            'Referer': targetOrigin + '/', 
             'Origin': targetOrigin,
-            'Cookie': req.headers.cookie || ''
+            'Cookie': req.headers.cookie || '' 
         };
 
         const response = await axios.get(targetUrl, {
@@ -40,6 +46,7 @@ app.get('/proxy', async (req, res) => {
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Content-Type', contentType);
 
+        // テキストデータ（HTMLなど）の時だけ書き換え処理をする
         if (contentType.includes('text')) {
             let content = response.data.toString('utf-8');
 
@@ -51,25 +58,23 @@ app.get('/proxy', async (req, res) => {
                 } catch (e) { return urlStr; }
             };
 
+            // 【重要修正 1】絶対パス除外ロジックを削除し、全て書き換えるように変更
             content = content.replace(
                 /(href|src|action|poster|data-src|data-poster|data-image)=["']([^"']+)["']/g, 
                 (match, attr, url) => {
-                    // 【修正1】絶対パス(http...)もプロキシ経由に書き換えるように変更
-                    // 元のコードにあった `if (url.startsWith('http')...` を削除しました。
-                    // これにより、絶対パスのリンクや検索フォームも正しくプロキシ経由になります。
-
                     return `${attr}="${rewriteUrl(url)}"`;
                 }
             );
 
+            // CSS書き換え
             content = content.replace(/url\(["']?([^"')]+)["']?\)/g, (full, url) => {
                 return `url("${rewriteUrl(url)}")`;
             });
 
-            // 【修正2】検索フォーム(GET)対策と画像読み込みスクリプト
-            const lazyLoadFix = `
+            // 【重要修正 2】検索フォーム対策スクリプトの注入
+            const scriptFix = `
             <script>
-                // 画像の遅延読み込み対策
+                // 1. 画像の遅延読み込み対策
                 setInterval(() => {
                     document.querySelectorAll('img[data-src]').forEach(img => {
                         if (img.dataset.src && (!img.src || img.src.indexOf('loading') > -1)) {
@@ -79,26 +84,33 @@ app.get('/proxy', async (req, res) => {
                     });
                 }, 500);
 
-                // 【追加】検索フォーム対策
-                // GETメソッドのフォーム送信時に、actionのURLパラメータが消えるのを防ぐ
+                // 2. 検索フォーム(GET)のパラメータ消失対策
                 document.addEventListener('submit', (e) => {
                     const form = e.target;
-                    // actionがプロキシを指しているか確認
-                    if (form.action.includes('/proxy')) {
-                        // URLから本来のターゲットURLを抽出
-                        const actionUrl = new URL(form.action);
-                        const params = new URLSearchParams(actionUrl.search);
-                        const targetUrl = params.get('url');
+                    const method = (form.method || 'GET').toUpperCase();
+                    
+                    // GET送信、かつactionがプロキシを向いている場合
+                    if (method === 'GET' && form.action.includes('/proxy')) {
+                        try {
+                            // action URLから本来のターゲットURL (url=...) を取り出す
+                            const actionUrl = new URL(form.action, window.location.origin);
+                            const params = new URLSearchParams(actionUrl.search);
+                            const originalTarget = params.get('url');
 
-                        if (targetUrl) {
-                            // 既にhidden inputがあるか確認
-                            if (!form.querySelector('input[name="url"]')) {
-                                const input = document.createElement('input');
-                                input.type = 'hidden';
-                                input.name = 'url';
-                                input.value = targetUrl;
-                                form.appendChild(input);
+                            if (originalTarget) {
+                                // hidden inputを作成してフォームに追加
+                                // これにより、送信時に 'url' パラメータが含まれるようになる
+                                let input = form.querySelector('input[name="url"]');
+                                if (!input) {
+                                    input = document.createElement('input');
+                                    input.type = 'hidden';
+                                    input.name = 'url';
+                                    form.appendChild(input);
+                                }
+                                input.value = originalTarget;
                             }
+                        } catch (err) {
+                            console.error('Proxy form fix error:', err);
                         }
                     }
                 });
@@ -106,8 +118,9 @@ app.get('/proxy', async (req, res) => {
             `;
             
             if (contentType.includes('html')) {
-                if(content.includes('</body>')) content = content.replace('</body>', lazyLoadFix + '</body>');
-                else content += lazyLoadFix;
+                // </body>の直前、なければ末尾に追加
+                if(content.includes('</body>')) content = content.replace('</body>', scriptFix + '</body>');
+                else content += scriptFix;
             }
 
             res.send(content);
@@ -116,8 +129,6 @@ app.get('/proxy', async (req, res) => {
         }
 
     } catch (error) {
-        // エラー詳細をログに出すとデバッグしやすいです
-        console.error(error.message);
-        if (!res.headersSent) res.status(500).send('Proxy Error');
+        if (!res.headersSent) res.status(500).send('Proxy Error: ' + error.message);
     }
 });
