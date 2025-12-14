@@ -2,133 +2,146 @@ const express = require('express');
 const axios = require('axios');
 const app = express();
 
-module.exports = app;
+// Vercel等のサーバーレス環境では /api/index.js がエントリポイントになることが多い
+// ローカル実行用とサーバーレス用の両方に対応できる記述にします
 
-app.get('/proxy', async (req, res) => {
-    let targetUrl = req.query.url;
+app.get('/api/index.js', async (req, res) => {
+    const targetUrl = req.query.url;
 
-    // 【追加】検索などでurlパラメータが消え、qパラメータなどが来た場合の救済措置は困難なため
-    // 基本的にはエラーを返すが、デバッグ用にログを出す
+    // URLがない場合はエラー
     if (!targetUrl) {
-        // console.log('Params missing. Query:', req.query); 
-        return res.status(400).send(`
-            <div style="padding:20px;font-family:sans-serif;">
-                <h3>URL is required.</h3>
-                <p>プロキシ経由のフォーム送信に失敗しました。</p>
-                <p>現在のクエリ: ${JSON.stringify(req.query)}</p>
-                <a href="/">トップに戻る</a>
-            </div>
-        `);
+        return res.status(400).send('URL parameter is required (e.g. ?url=https://example.com)');
     }
 
     try {
-        const urlObj = new URL(targetUrl);
-        const targetOrigin = urlObj.origin;
-
-        const headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Referer': targetOrigin + '/', 
-            'Origin': targetOrigin,
-            'Cookie': req.headers.cookie || '' 
-        };
-
+        // ターゲットサイトへリクエスト
         const response = await axios.get(targetUrl, {
-            headers: headers,
+            headers: {
+                // 一般的なブラウザのUser-Agentを偽装してブロック回避
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            },
+            // バイナリデータ（画像など）も扱えるようにarraybufferで受け取る
             responseType: 'arraybuffer',
-            validateStatus: () => true,
-            family: 4
+            validateStatus: () => true // 404や500でも処理を続行
         });
 
-        const contentType = response.headers['content-type'] || '';
-
-        res.removeHeader('X-Frame-Options');
-        res.removeHeader('Content-Security-Policy');
-        res.setHeader('Access-Control-Allow-Origin', '*');
+        // レスポンスヘッダの設定
+        const contentType = response.headers['content-type'];
         res.setHeader('Content-Type', contentType);
+        
+        // CORS許可
+        res.setHeader('Access-Control-Allow-Origin', '*');
 
-        // テキストデータ（HTMLなど）の時だけ書き換え処理をする
-        if (contentType.includes('text')) {
-            let content = response.data.toString('utf-8');
+        // HTMLの場合のみ書き換え処理を行う
+        if (contentType && contentType.includes('text/html')) {
+            let html = response.data.toString('utf-8');
+            const baseUrl = new URL(targetUrl); // ベースURLを取得
 
-            const rewriteUrl = (urlStr) => {
+            // --- ヘルパー関数: URLをプロキシ経由に変換 ---
+            const proxyfy = (urlStr) => {
                 try {
-                    if (!urlStr || urlStr.startsWith('data:') || urlStr.startsWith('#')) return urlStr;
-                    const absoluteUrl = new URL(urlStr, targetUrl).href;
-                    return `/proxy?url=${encodeURIComponent(absoluteUrl)}`;
-                } catch (e) { return urlStr; }
+                    // 相対パスを絶対パスに変換
+                    const absoluteUrl = new URL(urlStr, baseUrl.href).href;
+                    // プロキシURLとして返す
+                    return `/api/index.js?url=${encodeURIComponent(absoluteUrl)}`;
+                } catch (e) {
+                    return urlStr;
+                }
             };
 
-            // 【重要修正 1】絶対パス除外ロジックを削除し、全て書き換えるように変更
-            content = content.replace(
-                /(href|src|action|poster|data-src|data-poster|data-image)=["']([^"']+)["']/g, 
-                (match, attr, url) => {
-                    return `${attr}="${rewriteUrl(url)}"`;
-                }
-            );
-
-            // CSS書き換え
-            content = content.replace(/url\(["']?([^"')]+)["']?\)/g, (full, url) => {
-                return `url("${rewriteUrl(url)}")`;
+            // --- HTML書き換え処理 (簡易的なRegex置換) ---
+            
+            // href="..." の書き換え
+            html = html.replace(/href=["'](.*?)["']/g, (match, p1) => {
+                // #リンクやjavascript:などは除外
+                if (p1.startsWith('#') || p1.startsWith('javascript:')) return match;
+                return `href="${proxyfy(p1)}"`;
             });
 
-            // 【重要修正 2】検索フォーム対策スクリプトの注入
-            const scriptFix = `
+            // src="..." の書き換え
+            html = html.replace(/src=["'](.*?)["']/g, (match, p1) => {
+                return `src="${proxyfy(p1)}"`;
+            });
+
+            // action="..." (フォーム) の書き換え
+            // ただし、actionだけ変えてもinputのクエリパラメータがうまく渡らないことが多いため、
+            // 下記の注入スクリプトで補完します。ここでは絶対パス化しておく。
+            html = html.replace(/action=["'](.*?)["']/g, (match, p1) => {
+                 return `action="${proxyfy(p1)}"`;
+            });
+
+
+            // --- 重要: 検索フォームなどを正常動作させるためのスクリプト注入 ---
+            // </body>の直前にスクリプトを埋め込む
+            const injectionScript = `
             <script>
-                // 1. 画像の遅延読み込み対策
-                setInterval(() => {
-                    document.querySelectorAll('img[data-src]').forEach(img => {
-                        if (img.dataset.src && (!img.src || img.src.indexOf('loading') > -1)) {
-                            img.src = img.dataset.src;
-                            img.removeAttribute('data-src');
-                        }
-                    });
-                }, 500);
+                document.addEventListener('DOMContentLoaded', function() {
+                    // フォーム送信をフック
+                    document.querySelectorAll('form').forEach(form => {
+                        form.addEventListener('submit', function(e) {
+                            e.preventDefault(); // 本来の送信をキャンセル
+                            
+                            // フォームの送信先URLを作成
+                            const formData = new FormData(form);
+                            const searchParams = new URLSearchParams(formData);
+                            
+                            // 元のaction属性を取得（プロキシURLになっているはずだが、元のターゲットURLを復元する必要がある）
+                            let actionUrl = form.getAttribute('action');
+                            
+                            // もしactionがプロキシ形式 (/api/index.js?url=...) なら、
+                            // その中の実際のターゲットURLを取り出す処理
+                            let targetBase = "";
+                            try {
+                                const urlObj = new URL(actionUrl, window.location.origin);
+                                targetBase = urlObj.searchParams.get('url');
+                            } catch(err) { }
 
-                // 2. 検索フォーム(GET)のパラメータ消失対策
-                document.addEventListener('submit', (e) => {
-                    const form = e.target;
-                    const method = (form.method || 'GET').toUpperCase();
-                    
-                    // GET送信、かつactionがプロキシを向いている場合
-                    if (method === 'GET' && form.action.includes('/proxy')) {
-                        try {
-                            // action URLから本来のターゲットURL (url=...) を取り出す
-                            const actionUrl = new URL(form.action, window.location.origin);
-                            const params = new URLSearchParams(actionUrl.search);
-                            const originalTarget = params.get('url');
-
-                            if (originalTarget) {
-                                // hidden inputを作成してフォームに追加
-                                // これにより、送信時に 'url' パラメータが含まれるようになる
-                                let input = form.querySelector('input[name="url"]');
-                                if (!input) {
-                                    input = document.createElement('input');
-                                    input.type = 'hidden';
-                                    input.name = 'url';
-                                    form.appendChild(input);
-                                }
-                                input.value = originalTarget;
+                            if (!targetBase) {
+                                // 万が一取得できなければ現在のURLを使うなどのフォールバック
+                                targetBase = window.location.href; 
                             }
-                        } catch (err) {
-                            console.error('Proxy form fix error:', err);
-                        }
-                    }
+
+                            // GETメソッドの場合、クエリパラメータをターゲットURLに結合
+                            if (form.method.toLowerCase() === 'get') {
+                                // ターゲットURLに '?' が既にあるか確認
+                                const separator = targetBase.includes('?') ? '&' : '?';
+                                const finalTargetUrl = targetBase + separator + searchParams.toString();
+                                
+                                // プロキシ経由で遷移
+                                window.location.href = '/api/index.js?url=' + encodeURIComponent(finalTargetUrl);
+                            } else {
+                                // POSTメソッドなどは複雑なため今回はGET(検索)メインで対応
+                                // 必要であればここにPOST処理を追加
+                                console.log('POST forms not fully supported in simple proxy');
+                            }
+                        });
+                    });
                 });
             </script>
             `;
             
-            if (contentType.includes('html')) {
-                // </body>の直前、なければ末尾に追加
-                if(content.includes('</body>')) content = content.replace('</body>', scriptFix + '</body>');
-                else content += scriptFix;
-            }
+            // 閉じるbodyタグの前にスクリプトを挿入
+            html = html.replace('</body>', injectionScript + '</body>');
 
-            res.send(content);
+            res.send(html);
+
         } else {
+            // HTML以外（画像、CSS、JSなど）はそのまま返す
             res.send(response.data);
         }
 
     } catch (error) {
-        if (!res.headersSent) res.status(500).send('Proxy Error: ' + error.message);
+        console.error('Proxy Error:', error.message);
+        res.status(500).send(`Error fetching URL: ${error.message}`);
     }
 });
+
+// ローカルでのテスト実行用
+// Vercel上ではエクスポートされた関数が使われるため、listenは不要だが
+// 開発用に残しておく場合は if (require.main === module) で囲むのが一般的
+if (require.main === module) {
+    const PORT = process.env.PORT || 3000;
+    app.listen(PORT, () => console.log(`Proxy server running on port ${PORT}`));
+}
+
+module.exports = app;
