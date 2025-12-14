@@ -1,189 +1,212 @@
 const express = require('express');
 const axios = require('axios');
+const cookieParser = require('cookie-parser');
+const path = require('path');
 const app = express();
 
-// クエリストリングなどの制限を緩和
+app.use(cookieParser());
+// バイナリデータも含めて広く受け付ける設定
 app.use(express.raw({ type: '*/*', limit: '10mb' }));
 
-app.get('/api/index.js', async (req, res) => {
-    const targetUrl = req.query.url;
+app.all('/api/index.js', async (req, res) => {
+    // 1. URLの決定ロジック
+    // クエリパラメータ ?url=... が最優先
+    let targetUrl = req.query.url;
 
-    // URLがない場合はエラー
+    // クエリパラメータがない場合、Cookieから「最後に訪れたサイト」を取得してパスを結合する
+    // これが「3回目で404になる」「検索できない」を防ぐ安全策
     if (!targetUrl) {
-        return res.status(400).send('URL parameter is required');
+        const lastSite = req.cookies['proxy_target_site']; // Cookieからドメイン取得
+        const originalPath = req.headers['x-now-route-matches'] 
+                             ? req.headers['x-now-route-matches'] // Vercel特有のパス取得
+                             : req.originalUrl; // ローカル用
+
+        if (lastSite && originalPath) {
+            // 例: lastSite="https://xvideos.com", originalPath="/video123"
+            // => "https://xvideos.com/video123" を構築
+            try {
+                // originalPathが /api/index.js 自体を指している場合は無視
+                if (!originalPath.startsWith('/api/index.js')) {
+                    const u = new URL(originalPath, lastSite);
+                    targetUrl = u.href;
+                }
+            } catch (e) {}
+        }
     }
 
-    try {
-        // URLの妥当性チェックと整形
-        let validUrl = targetUrl;
-        if (!validUrl.startsWith('http')) {
-             // 万が一完全なURLでない場合
-             return res.status(400).send('Invalid URL');
-        }
+    // それでもURLがない、かつトップページへのアクセスの場合は、入力フォーム(index.html)を返す
+    if (!targetUrl) {
+        // public/index.htmlの内容を返す簡易実装（fsを使わず直接HTMLを返す）
+        // ※ Vercelのファイル読み込み構成に依存しないように文字列で返します
+        return res.send(`
+            <!DOCTYPE html>
+            <html lang="ja">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Web Proxy V3</title>
+                <style>
+                    body{font-family:sans-serif;background:#f4f4f4;display:flex;flex-direction:column;height:100vh;margin:0}
+                    header{background:#2c3e50;padding:10px;color:white;display:flex;gap:10px}
+                    input{flex:1;padding:8px;border-radius:4px;border:none}
+                    button{padding:8px;background:#3498db;color:white;border:none;border-radius:4px;cursor:pointer}
+                    iframe{flex:1;border:none}
+                </style>
+            </head>
+            <body>
+                <header>
+                    <b>Proxy V3</b>
+                    <form id="f" style="display:flex;flex:1;gap:5px">
+                        <input id="u" type="text" placeholder="https://example.com">
+                        <button>Go</button>
+                    </form>
+                </header>
+                <iframe id="frm"></iframe>
+                <script>
+                    document.getElementById('f').onsubmit = e => {
+                        e.preventDefault();
+                        let u = document.getElementById('u').value;
+                        if(!u.startsWith('http')) u = 'https://' + u;
+                        document.getElementById('frm').src = '/api/index.js?url=' + encodeURIComponent(u);
+                    }
+                </script>
+            </body>
+            </html>
+        `);
+    }
 
-        // ベースURL（相対パス解決用）
-        const urlObj = new URL(validUrl);
-        const baseUrl = urlObj.origin; 
-        
-        // ターゲットサイトへリクエスト
-        const response = await axios.get(validUrl, {
-            headers: {
-                // PC用Chromeに偽装（モバイル版だと構造が変わりすぎて解析しにくい場合があるため）
-                // 必要に応じてモバイルUAに変えてもOKですが、安定性のためPC UA推奨
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
-                'Referer': baseUrl // リファラ偽装（画像の読み込み制限回避などに有効）
-            },
-            responseType: 'arraybuffer', // 画像やフォントも扱えるようにバイナリで取得
-            validateStatus: () => true // 404/500エラーでもプロキシ自体は動作させる
+    // --- ここからプロキシ処理 ---
+
+    try {
+        // 2. Cookieの更新（現在アクセスしているドメインを保存）
+        const urlObj = new URL(targetUrl);
+        const currentOrigin = urlObj.origin;
+        res.cookie('proxy_target_site', currentOrigin, { 
+            maxAge: 900000, // 15分
+            httpOnly: true,
+            secure: true,
+            sameSite: 'None'
         });
 
-        // レスポンスヘッダのコピー（CORS対策）
+        // 3. ターゲットへのリクエスト
+        // 検索クエリ (?k=word) などが targetUrl に含まれているか確認し、
+        // 含まれていない場合は req.query をそのまま転送する考慮も必要だが
+        // 上記のロジックで targetUrl 自体が完全なURLになっているはず。
+
+        const response = await axios({
+            method: req.method,
+            url: targetUrl,
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
+                'Referer': currentOrigin,
+                'Cookie': req.headers['cookie'] // 必要ならCookieも転送（ログイン維持など）
+            },
+            data: req.body, // POSTデータ転送
+            responseType: 'arraybuffer',
+            validateStatus: () => true
+        });
+
+        // 4. レスポンスヘッダの設定
         const contentType = response.headers['content-type'] || '';
         res.setHeader('Content-Type', contentType);
         res.setHeader('Access-Control-Allow-Origin', '*');
-        
-        // --- ヘルパー関数: URLをプロキシ形式に変換 ---
+
+        // リダイレクト対応 (301, 302)
+        // サイトがリダイレクトを返してきた場合、プロキシ内で完結させる
+        if ([301, 302, 303, 307, 308].includes(response.status)) {
+            const location = response.headers['location'];
+            if (location) {
+                const absoluteRedirect = new URL(location, targetUrl).href;
+                return res.redirect(`/api/index.js?url=${encodeURIComponent(absoluteRedirect)}`);
+            }
+        }
+
+        // --- コンテンツ書き換えヘルパー ---
         const proxyfy = (path) => {
             if (!path) return '';
-            // データURIやハッシュは無視
             if (path.startsWith('data:') || path.startsWith('#') || path.startsWith('javascript:')) return path;
-            
             try {
-                // 相対パスを絶対パスに変換
-                const absoluteUrl = new URL(path, validUrl).href;
-                // 自分自身（プロキシAPI）を通してアクセスさせるURLを作成
-                return `/api/index.js?url=${encodeURIComponent(absoluteUrl)}`;
-            } catch (e) {
-                return path;
-            }
+                const absolute = new URL(path, targetUrl).href;
+                return `/api/index.js?url=${encodeURIComponent(absolute)}`;
+            } catch (e) { return path; }
         };
 
-        // --- コンテンツタイプ別の処理 ---
-
-        // 1. HTMLの場合
+        // 5. HTML/CSSの書き換え
         if (contentType.includes('text/html')) {
             let html = response.data.toString('utf-8');
 
-            // 正規表現で静的なリンクを書き換え
-            // href, src, action, data-src(遅延ロード画像用), poster(動画サムネ用)
-            const regexAttrs = /(href|src|action|data-src|poster)=["'](.*?)["']/g;
-            html = html.replace(regexAttrs, (match, attr, path) => {
-                return `${attr}="${proxyfy(path)}"`;
+            // 基本的なリンク書き換え
+            html = html.replace(/(href|src|action|poster|data-src)=["'](.*?)["']/g, (_, attr, val) => `${attr}="${proxyfy(val)}"`);
+            
+            // CSS url()
+            html = html.replace(/url\(['"]?(.*?)['"]?\)/g, (_, val) => `url('${proxyfy(val)}')`);
+
+            // srcset
+            html = html.replace(/srcset=["'](.*?)["']/g, (_, val) => {
+                return `srcset="${val.split(',').map(p => {
+                    const [u, s] = p.trim().split(' ');
+                    return proxyfy(u) + (s ? ' ' + s : '');
+                }).join(', ')}"`;
             });
 
-            //srcset (レスポンシブ画像) の書き換え
-            html = html.replace(/srcset=["'](.*?)["']/g, (match, content) => {
-                // srcsetは "url size, url size" の形式
-                const newContent = content.split(',').map(part => {
-                    const trimmed = part.trim();
-                    const spaceIndex = trimmed.lastIndexOf(' ');
-                    if (spaceIndex === -1) return proxyfy(trimmed);
-                    const url = trimmed.substring(0, spaceIndex);
-                    const size = trimmed.substring(spaceIndex);
-                    return proxyfy(url) + size;
-                }).join(', ');
-                return `srcset="${newContent}"`;
-            });
-
-            // CSSのstyleタグ内のurl()書き換え (background-imageなど)
-            html = html.replace(/url\(['"]?(.*?)['"]?\)/g, (match, url) => {
-                return `url('${proxyfy(url)}')`;
-            });
-
-            // --- 【重要】クライアントサイドでの動作補正スクリプト ---
-            // 404回避と動的リンク対応のため、強力なスクリプトを注入します
-            const injectionScript = `
+            // 6. 強力なクライアントサイド補正スクリプト
+            // 検索フォームとリンククリックを制御
+            const script = `
             <script>
-                (function() {
-                    const currentProxyUrl = '/api/index.js?url=';
-                    const targetOrigin = '${baseUrl}'; // 元サイトのオリジン
-                    const currentTargetUrl = '${validUrl}'; // 現在見ているページ
-
-                    // URLをプロキシ形式に変換する関数
-                    function toProxyUrl(url) {
-                        if(!url) return url;
-                        if(url.startsWith('data:') || url.startsWith('#') || url.startsWith('javascript:')) return url;
-                        // 既にプロキシ経由なら何もしない
-                        if(url.includes('/api/index.js?url=')) return url;
-
-                        try {
-                            // 相対パスを絶対パスにしてからプロキシURL化
-                            const absolute = new URL(url, currentTargetUrl).href;
-                            return currentProxyUrl + encodeURIComponent(absolute);
-                        } catch(e) { return url; }
+            (function(){
+                const origin = '${currentOrigin}';
+                
+                // リンククリック監視
+                document.body.addEventListener('click', e => {
+                    const a = e.target.closest('a');
+                    if(a && a.href && !a.href.startsWith('javascript') && !a.href.includes('/api/index.js')) {
+                        e.preventDefault();
+                        // リンク先が相対パスでも、ブラウザが解決した絶対パスを取得できる
+                        const target = new URL(a.href, '${targetUrl}').href;
+                        window.location.href = '/api/index.js?url=' + encodeURIComponent(target);
                     }
+                }, true);
 
-                    document.addEventListener('DOMContentLoaded', function() {
+                // フォーム送信監視 (検索対策)
+                document.querySelectorAll('form').forEach(f => {
+                    f.addEventListener('submit', e => {
+                        e.preventDefault();
+                        const formData = new FormData(f);
+                        const params = new URLSearchParams(formData).toString();
+                        let action = f.getAttribute('action') || '';
                         
-                        // 1. クリックイベントのハイジャック (これが404対策の肝)
-                        // ページ内のどこをクリックしても、もしそれがリンクなら強制的にプロキシ経由にする
-                        document.body.addEventListener('click', function(e) {
-                            const anchor = e.target.closest('a');
-                            if (anchor) {
-                                const href = anchor.getAttribute('href');
-                                if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
-                                    e.preventDefault(); // 本来の遷移を止める
-                                    window.location.href = toProxyUrl(href);
-                                }
-                            }
-                        }, true);
+                        // actionを絶対URLに変換
+                        let finalUrl;
+                        try {
+                            const u = new URL(action, '${targetUrl}'); // 現在のページをベースに解決
+                            // クエリパラメータ結合
+                            u.search += (u.search ? '&' : '') + params;
+                            finalUrl = u.href;
+                        } catch(err) {
+                            finalUrl = '${targetUrl}?' + params;
+                        }
 
-                        // 2. フォーム送信のハイジャック (検索バー対策)
-                        document.querySelectorAll('form').forEach(form => {
-                            form.addEventListener('submit', function(e) {
-                                e.preventDefault();
-                                const formData = new FormData(form);
-                                const params = new URLSearchParams(formData);
-                                let action = form.getAttribute('action') || currentTargetUrl;
-                                
-                                // actionがプロキシURLになっていたら、元のターゲットURLを復元してパラメータを付ける
-                                // 簡易的に、actionを絶対パス化してパラメータ結合し、再度プロキシ化する
-                                try {
-                                    const actionAbs = new URL(action, currentTargetUrl).href;
-                                    // パラメータ結合
-                                    const separator = actionAbs.includes('?') ? '&' : '?';
-                                    const finalUrl = actionAbs + separator + params.toString();
-                                    window.location.href = currentProxyUrl + encodeURIComponent(finalUrl);
-                                } catch(err) {
-                                    console.error(err);
-                                }
-                            });
-                        });
+                        window.location.href = '/api/index.js?url=' + encodeURIComponent(finalUrl);
                     });
-                })();
+                });
+            })();
             </script>
             `;
-
-            // bodyの閉じタグ直前にスクリプト挿入
-            html = html.replace('</body>', injectionScript + '</body>');
+            html = html.replace('</body>', script + '</body>');
             res.send(html);
 
-        } 
-        // 2. CSSの場合 (ボタン崩れ対策)
-        else if (contentType.includes('text/css')) {
+        } else if (contentType.includes('text/css')) {
             let css = response.data.toString('utf-8');
-            // CSS内の url(...) を書き換え
-            // ../fonts/icon.woff などを正しくプロキシ経由にする
-            css = css.replace(/url\(['"]?(.*?)['"]?\)/g, (match, path) => {
-                return `url('${proxyfy(path)}')`;
-            });
+            css = css.replace(/url\(['"]?(.*?)['"]?\)/g, (_, val) => `url('${proxyfy(val)}')`);
             res.send(css);
-        }
-        // 3. その他（画像、フォント、JSファイルなど）
-        else {
-            // そのままバイナリとして返す
+        } else {
             res.send(response.data);
         }
 
-    } catch (error) {
-        console.error('Proxy Error:', error.message);
-        // エラー内容を表示せず、元のプロキシトップに戻すか、エラーを表示する
-        res.status(500).send(`
-            <div style="color:red; padding:20px;">
-                Proxy Error: ${error.message}<br>
-                <a href="/">Go back to Home</a>
-            </div>
-        `);
+    } catch (e) {
+        console.error(e);
+        // エラー時もCookieがあればリトライできるかもしれないが、一旦エラー表示
+        res.status(500).send('Proxy Error: ' + e.message);
     }
 });
 
